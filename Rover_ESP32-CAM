@@ -1,0 +1,273 @@
+/*
+  ESP32-CAM (AI-Thinker) + L9110S + STREAM EMBUTIDO + CAPTURA
+  - UI e controle na porta 80
+  - Streaming MJPEG na porta 81 (/stream)
+  - Captura de foto na porta 80 (/photo)  <<--- evita CORS
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_http_server.h"
+#include "esp_camera.h"
+
+// -------- AP --------
+const char* AP_SSID = "TESTE-L9110S";
+const char* AP_PASS = "12345678";
+
+// -------- L9110S (SEU MAPEAMENTO) --------
+const uint8_t A_IA = 13;
+const uint8_t A_IB = 15;
+const uint8_t B_IA = 14;
+const uint8_t B_IB = 2;   // cuidado: não manter preso em GND no boot
+const bool INVERT_A = false;
+const bool INVERT_B = false;
+
+// -------- Web (porta 80) --------
+WebServer server(80);
+volatile char lastCmd = 'S';
+
+// -------- CÂMERA: pinos AI-Thinker --------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// -------- STREAM (porta 81) --------
+httpd_handle_t stream_httpd = NULL;
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+static const char* _STREAM_BOUNDARY     = "\r\n--frame\r\n";
+static const char* _STREAM_PART         = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+// ===================== CONTROLE (igual ao seu) =====================
+void stopAll() {
+  pinMode(A_IA, OUTPUT); digitalWrite(A_IA, LOW);
+  pinMode(A_IB, OUTPUT); digitalWrite(A_IB, LOW);
+  pinMode(B_IA, OUTPUT); digitalWrite(B_IA, LOW);
+  pinMode(B_IB, OUTPUT); digitalWrite(B_IB, LOW);
+}
+
+void driveRaw(bool motorA, int dir) { // -1=r, 0=parar, +1=f
+  uint8_t IA = motorA ? (INVERT_A ? A_IB : A_IA) : (INVERT_B ? B_IB : B_IA);
+  uint8_t IB = motorA ? (INVERT_A ? A_IA : A_IB) : (INVERT_B ? B_IA : B_IB);
+  if (dir < 0) { uint8_t t = IA; IA = IB; IB = t; } // inverte se ré
+
+  pinMode(IA, OUTPUT); pinMode(IB, OUTPUT);
+  if (dir == 0) { digitalWrite(IA, LOW); digitalWrite(IB, LOW); }      // stop
+  else          { digitalWrite(IA, HIGH); digitalWrite(IB, LOW); }     // gira
+}
+
+void aplicar(char c) {
+  lastCmd = c;
+  switch (c) {
+    case 'L': driveRaw(true, +1); driveRaw(false, +1); break; // frente F
+    case 'R': driveRaw(true, -1); driveRaw(false, -1); break; // ré B
+    case 'B': driveRaw(true, +1); driveRaw(false, -1); break; // esquerda L
+    case 'F': driveRaw(true, -1); driveRaw(false, +1); break; // direita  R
+    default:  stopAll(); break;
+  }
+  const char* nome = (c=='F')?"Frente":(c=='B')?"Ré":(c=='L')?"Esquerda":(c=='R')?"Direita":"Parar";
+  Serial.printf("[CMD] %c (%s)\n", c, nome);
+}
+
+// ===================== HTML (vídeo + botão foto + controles) =====================
+String page(IPAddress ip) {
+  String s;
+  s.reserve(9600);
+  s += "<!doctype html><html><head><meta charset='utf-8'/>";
+  s += "<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1'/>";
+  s += "<title>ESP32-CAM + L9110S</title><style>";
+  s += "html,body{height:100%} body{margin:0;font-family:system-ui,Arial;display:flex;align-items:center;justify-content:center;background:#fff}";
+  s += ".container{display:flex;flex-direction:column;align-items:center;gap:18px;width:100%;max-width:960px;min-height:100vh;padding:16px 18px;box-sizing:border-box}";
+  s += ".title{margin:0;font-size:clamp(18px,2.8vw,28px);font-weight:700}";
+  s += ".sub{margin:0;color:#555;font-size:clamp(12px,2.2vw,15px)}";
+  s += ".video{width:100%;display:flex;flex-direction:column;align-items:center;gap:10px}";
+  s += ".video img{width:100%;max-width:900px;aspect-ratio:4/3;height:auto;border-radius:12px;border:1px solid #dcdcdc;object-fit:cover;background:#f6f6f6}";
+  s += ".bar{display:flex;gap:10px;justify-content:center}";
+  s += "a.btn{display:inline-block;text-decoration:none;color:#000;background:#eef}";
+  s += "a.btn{font-size:clamp(14px,2.4vw,18px);padding:10px 14px;border-radius:10px;border:1px solid #ccc;box-shadow:0 1px 3px rgba(0,0,0,.12)}";
+  s += ".pad{width:100%;max-width:620px;display:flex;flex-direction:column;align-items:center;gap:12px}";
+  s += ".row{display:flex;gap:12px;justify-content:center;align-items:center}";
+  s += "button{font-size:clamp(16px,2.8vw,20px);padding:16px 20px;border-radius:12px;border:1px solid #ccc;box-shadow:0 1px 4px rgba(0,0,0,.12);touch-action:manipulation}";
+  s += ".big{width:clamp(120px,35vw,220px);height:clamp(64px,14vw,92px)}";
+  s += ".stop{background:#fdd}.go{background:#dfd}.lr{background:#eef}";
+  s += "@media (max-width:520px){ .container{gap:14px;padding:12px} .row{gap:10px} }";
+  s += "</style></head><body>";
+
+  s += "<div class='container'>";
+  s += "  <h2 class='title'>ESP32-CAM + L9110S</h2>";
+  s += "  <p class='sub'>Acesse: <b>http://" + ip.toString() + "/</b></p>";
+
+  s += "  <div class='video'>";
+  s += "    <img id='cam' src='http://" + ip.toString() + ":81/stream' alt='camera'/>";
+  s += "    <div class='bar'><a class='btn' id='snap' href='/photo'>Tirar foto</a></div>"; // <<— navega para /photo (mesma porta)
+  s += "  </div>";
+
+  s += "  <div class='pad'>";
+  s += "    <div class='row'><button class='big go' id='btnF'>Frente</button></div>";
+  s += "    <div class='row'><button class='big lr' id='btnL'>Esquerda</button>";
+  s += "      <button class='big stop' id='btnS'>Parar</button>";
+  s += "      <button class='big lr' id='btnR'>Direita</button></div>";
+  s += "    <div class='row'><button class='big' id='btnB'>Ré</button></div>";
+  s += "  </div>";
+  s += "</div>";
+
+  // JS do controle (inalterado)
+  s += "<script>";
+  s += "let t=null,cur='S';function send(c){fetch('/cmd?c='+c).catch(()=>{})}";
+  s += "function start(c){cur=c;send(c);if(t)clearInterval(t);t=setInterval(()=>send(c),150)}";
+  s += "function stop(){if(t)clearInterval(t);t=null;cur='S';send('S')}";
+  s += "function bind(id,c){let e=document.getElementById(id);e.onmousedown=()=>start(c);e.onmouseup=stop;";
+  s += "e.ontouchstart=(ev)=>{ev.preventDefault();start(c)};e.ontouchend=stop}";
+  s += "bind('btnF','F');bind('btnL','L');bind('btnR','R');bind('btnB','B');bind('btnS','S');";
+  s += "document.addEventListener('keydown',e=>{let k=e.key.toLowerCase();if(cur!=='S')return;";
+  s += "if(['w','arrowup'].includes(k))start('F');else if(['s','arrowdown'].includes(k))start('B');";
+  s += "else if(['a','arrowleft'].includes(k))start('L');else if(['d','arrowright'].includes(k))start('R')});";
+  s += "document.addEventListener('keyup',stop);";
+  s += "</script></body></html>";
+  return s;
+}
+
+// ===================== Handlers (porta 80) =====================
+void handleRoot(){ server.sendHeader("Cache-Control","no-store"); server.send(200,"text/html", page(WiFi.softAPIP())); }
+void handleCmd(){
+  if (!server.hasArg("c")) { server.send(400,"text/plain","falta c"); return; }
+  char c = toupper(server.arg("c")[0]);
+  if (c!='F'&&c!='B'&&c!='L'&&c!='R'&&c!='S'){ server.send(400,"text/plain","invalido"); return; }
+  aplicar(c);
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.send(200,"text/plain","OK");
+}
+void handleNotFound(){ server.send(404,"text/plain","Not found"); }
+
+// NOVO: captura na porta 80 (mesma origin) — navegação baixa o JPEG
+void handlePhoto(){
+  camera_fb_t *fb = esp_camera_fb_get();
+  if(!fb){ server.send(500,"text/plain","camera error"); return; }
+  server.sendHeader("Content-Type","image/jpeg");
+  server.sendHeader("Content-Disposition","attachment; filename=\"foto.jpg\"");
+  server.setContentLength(fb->len);
+  server.send(200, "image/jpeg", "");                // envia cabeçalhos
+  WiFiClient client = server.client();
+  client.write(fb->buf, fb->len);                    // envia bytes
+  esp_camera_fb_return(fb);
+}
+
+// ===================== CÂMERA (init + stream na 81) =====================
+bool initCamera(){
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if(psramFound()){
+    config.frame_size   = FRAMESIZE_QVGA; // 320x240
+    config.jpeg_quality = 12;             // 10..20 (menor = melhor)
+    config.fb_count     = 2;
+  }else{
+    config.frame_size   = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 15;
+    config.fb_count     = 1;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("[CAM] Init falhou: 0x%x\n", err);
+    return false;
+  }
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 0);
+  return true;
+}
+
+static esp_err_t stream_handler(httpd_req_t *req){
+  esp_err_t res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if(res != ESP_OK) return res;
+
+  char part[64];
+  while(true){
+    camera_fb_t * fb = esp_camera_fb_get();
+    if(!fb){ res = ESP_FAIL; break; }
+
+    size_t hlen = snprintf(part, sizeof(part), _STREAM_PART, fb->len);
+    if (httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY)) != ESP_OK) { esp_camera_fb_return(fb); break; }
+    if (httpd_resp_send_chunk(req, part, hlen) != ESP_OK)                                { esp_camera_fb_return(fb); break; }
+    if (httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len) != ESP_OK)             { esp_camera_fb_return(fb); break; }
+
+    esp_camera_fb_return(fb);
+  }
+  return res;
+}
+
+void startStreamServer(){
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;        // stream na 81
+  config.ctrl_port   = 32769;
+  httpd_handle_t srv = NULL;
+  if (httpd_start(&srv, &config) == ESP_OK) {
+    httpd_uri_t uri = { .uri="/stream", .method=HTTP_GET, .handler=stream_handler, .user_ctx=NULL };
+    httpd_register_uri_handler(srv, &uri);
+    stream_httpd = srv;
+    Serial.printf("[STREAM] MJPEG em http://%s:81/stream\n", WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("[STREAM] Falha ao iniciar servidor");
+  }
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  stopAll();
+
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.printf("[AP] %s | SSID=%s | PASS=%s | IP=%s\n", ok?"Ativo":"Falhou", AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
+
+  if(!initCamera()){
+    Serial.println("[CAM] ERRO ao iniciar câmera — verifique 5V/PSRAM.");
+  } else {
+    startStreamServer();
+  }
+
+  // UI (porta 80)
+  server.on("/",    HTTP_GET, handleRoot);
+  server.on("/cmd", HTTP_GET, handleCmd);
+  server.on("/photo", HTTP_GET, handlePhoto);   // <<--- novo endpoint para download do JPEG
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("[HTTP] Página com controle + vídeo + botão de foto.");
+}
+
+void loop() {
+  server.handleClient();
+}
